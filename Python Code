@@ -1,0 +1,514 @@
+import re
+import math
+import os
+import sys
+import glob
+from typing import Any
+
+
+# ==========================================
+# 1. UTILITIES & SETUP
+# ==========================================
+
+def set_working_directory():
+    if getattr(sys, 'frozen', False):
+        app_path = os.path.dirname(sys.executable)
+    else:
+        app_path = os.path.dirname(os.path.abspath(__file__))
+    os.chdir(app_path)
+    return app_path
+
+
+def get_float_input(prompt, default=None):
+    while True:
+        try:
+            val = input(prompt)
+            if default is not None and val.strip() == "": return default
+            return float(val)
+        except ValueError:
+            print("Please enter a valid number.")
+
+
+def select_gcode_file(prompt_text="Select File"):
+    files = [f for f in glob.glob("*.gcode") if "_transformed" not in f and "_combo" not in f]
+    if not files:
+        print(f"❌ No .gcode file found in: {os.getcwd()}")
+        path = input("Enter manual path: ").strip('"')
+        return path if os.path.isfile(path) else None
+    print(f"\n--- {prompt_text} ---")
+    for i, f in enumerate(files): print(f"[{i + 1}] {f}")
+    while True:
+        try:
+            val = input("File number: ")
+            sel = int(val)
+            if 1 <= sel <= len(files): return files[sel - 1]
+        except ValueError:
+            pass
+        print("Invalid selection.")
+
+
+# ==========================================
+# 2. JUMP LOGIC (HEADER WITH M76)
+# ==========================================
+
+def split_line_jump(x1, y1, x2, y2, f, step_dist):
+    dist = math.hypot(x2 - x1, y2 - y1)
+    if dist < 0.001 or step_dist <= 0: return [(x2, y2, f)]
+    segments = int(math.ceil(dist / step_dist))
+    if segments < 1: segments = 1
+    points = []
+    for i in range(1, segments + 1):
+        t = i / segments
+        nx = x1 + (x2 - x1) * t
+        ny = y1 + (y2 - y1) * t
+        points.append((nx, ny, f))
+    return points
+
+
+def generate_jump_block(jump_file, z_work_abs, z_hop_abs, step_mm, pause_s, offset_x, offset_y):
+    generated_lines = []
+
+    # --- JUMP HEADER ---
+    generated_lines.append("T0")
+    generated_lines.append("M106 S0")
+    generated_lines.append("M104 T0 S0")
+    generated_lines.append("M104 T1 S0")
+    generated_lines.append("M76")
+    # -------------------
+
+    curr_x = 0.0
+    curr_y = 0.0
+    curr_f = 1000.0
+    found_start = False
+
+    with open(jump_file, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not found_start:
+                if line.startswith(";LAYER_COUNT:"): found_start = True
+                continue
+            if line.startswith(";TIME_ELAPSED:"): break
+
+            if line.startswith("G0") or line.startswith("G1"):
+                coords = {}
+                matches = re.findall(r"([XYF])([-+]?\d*\.?\d+)", line)
+                for c, v in matches: coords[c] = float(v)
+
+                raw_x = coords.get("X", curr_x - offset_x)
+                raw_y = coords.get("Y", curr_y - offset_y)
+                target_x = raw_x + offset_x
+                target_y = raw_y + offset_y
+                target_f = coords.get("F", curr_f)
+                curr_f = target_f
+
+                # G0 TRAVEL vs G1 WORK
+                if line.startswith("G0"):
+                    generated_lines.append(f"G0 X{target_x:.3f} Y{target_y:.3f} Z{z_hop_abs:.3f}")
+                else:
+                    segments = split_line_jump(curr_x, curr_y, target_x, target_y, curr_f, step_mm)
+                    for sx, sy, sf in segments:
+                        generated_lines.append(f"G1 Z{z_hop_abs:.3f}")
+                        generated_lines.append(f"G1 X{sx:.3f} Y{sy:.3f} F{sf:.1f}")
+                        generated_lines.append(f"G1 Z{z_work_abs:.3f}")
+                        generated_lines.append("M400")
+                        generated_lines.append(f"G4 S{pause_s}")
+                        generated_lines.append("M400")
+
+                curr_x = target_x
+                curr_y = target_y
+
+    return generated_lines
+
+
+# ==========================================
+# 3. READER & MERGER (Pre-Offset Return + Differentiated Pause + ETA)
+# ==========================================
+
+def read_and_merge_gcode(main_file, config_params, use_rotary):
+    lines_buffer: list[Any] = []
+
+    curr_x = 0.0
+    curr_y = 0.0
+    curr_z = 0.0
+    curr_f = 1000.0
+    curr_tool = "T0"
+
+    with open(main_file, 'r') as f:
+        original_lines = f.readlines()
+
+    metadata = config_params.copy()
+    metadata.update({'min_x': 0, 'min_y': 0, 'min_z': 0, 'layer_height': 0.2, 'layer_count': 0})
+    for line in original_lines[:100]:
+        l = line.lower().strip()
+        if l.startswith(";minx:"): metadata['min_x'] = float(l.split(":")[1])
+        if l.startswith(";miny:"): metadata['min_y'] = float(l.split(":")[1])
+        if l.startswith(";minz:"): metadata['min_z'] = float(l.split(":")[1])
+        if "layer height:" in l: metadata['layer_height'] = float(l.split("layer height:")[1])
+        if l.startswith(";layer_count:"): metadata['layer_count'] = int(l.split(":")[1])
+
+    print(f"File Metadata: MinZ={metadata['min_z']}, Layers={metadata['layer_count']}")
+
+    jump_executed = False
+    JUMP_OFFSET_Y = -26
+    JUMP_OFFSET_X = -90 if not use_rotary else 0.0
+    print(f"[OFFSET JUMP] X: {JUMP_OFFSET_X} | Y: {JUMP_OFFSET_Y}")
+
+    for line in original_lines:
+        line_strip = line.strip()
+
+        if line_strip.startswith("G0") or line_strip.startswith("G1"):
+            coords = re.findall(r"([XYZF])([-+]?\d*\.?\d+)", line_strip)
+            for c, v in coords:
+                if c == 'X': curr_x = float(v)
+                if c == 'Y': curr_y = float(v)
+                if c == 'Z': curr_z = float(v)
+                if c == 'F': curr_f = float(v)
+
+        # T1 PURGE
+        if line_strip == "T1":
+            lines_buffer.append(line)
+
+            if curr_tool == "T0" and use_rotary:
+                print(f"⚠️ Tool change T0->T1. Inserting E30 purge...")
+                lines_buffer.append("; --- AUTO PURGE T1 ---\n")
+                lines_buffer.append("G0 X-127 Z100 ; NO_TRANSFORM\n")
+                lines_buffer.append("G1 E30 F200\n")
+
+                radius = metadata['diameter'] / 2.0
+                safe_z_return = curr_z + radius
+                lines_buffer.append(f"G0 X0 Z{safe_z_return:.3f} F{curr_f:.0f} ; NO_TRANSFORM\n")
+                lines_buffer.append("; -------------------------\n")
+
+            curr_tool = "T1"
+            continue
+
+        elif line_strip == "T0":
+            curr_tool = "T0"
+
+        # JUMP LOGIC (M76) + PRE-OFFSET RETURN + DIFFERENTIATED PAUSE + ETA
+        if "M76" in line and not jump_executed:
+            lines_buffer.append(line)
+            print(f"\n⚠️ Found M76 at Z={curr_z:.3f}")
+            if input("Insert JUMP + X-90? (y/n): ").lower() == 'y':
+                jump_file = select_gcode_file("Pattern File (JUMP)")
+                if jump_file:
+                    z_work_abs = curr_z + 0.2
+                    hop_rel = get_float_input("Jump height (relative): ")
+                    z_hop_abs = z_work_abs + hop_rel
+                    step_mm = get_float_input("Segment length (mm): ")
+                    
+                    # Pause for the FIRST pass
+                    pause_s_first = get_float_input("Pause duration (s) [1st pass]: ")
+
+                    num_passes = int(get_float_input("Number of passes (Default 1): ", 1))
+                    if num_passes < 1: num_passes = 1
+                    
+                    # Pause for SUBSEQUENT passes
+                    pause_s_next = pause_s_first
+                    if num_passes > 1:
+                        pause_s_next = get_float_input(f"Pause duration for subsequent passes (2-{num_passes}) (s): ")
+
+                    lines_buffer.append("G0 X-90 ; NO_TRANSFORM\n")
+
+                    # Block generation
+                    # 1. Block with "first pass" pause
+                    lines_pass_1 = generate_jump_block(jump_file, z_work_abs, z_hop_abs, step_mm, pause_s_first,
+                                                            JUMP_OFFSET_X, JUMP_OFFSET_Y)
+                    
+                    # 2. Block with "subsequent passes" pause (only if different)
+                    lines_pass_next = lines_pass_1
+                    if num_passes > 1 and pause_s_next != pause_s_first:
+                        lines_pass_next = generate_jump_block(jump_file, z_work_abs, z_hop_abs, step_mm, pause_s_next,
+                                                                   JUMP_OFFSET_X, JUMP_OFFSET_Y)
+
+                    # --- ETA CALCULATION (JUMP) ---
+                    # Count how many times G4 (Pause) appears in the generated blocks
+                    count_g4_pass_1 = sum(1 for l in lines_pass_1 if l.strip().startswith("G4"))
+                    total_seconds = count_g4_pass_1 * pause_s_first
+                    
+                    if num_passes > 1:
+                        count_g4_pass_next = sum(1 for l in lines_pass_next if l.strip().startswith("G4"))
+                        total_seconds += (count_g4_pass_next * pause_s_next * (num_passes - 1))
+                    
+                    m_eta, s_eta = divmod(int(total_seconds), 60)
+                    h_eta, m_eta = divmod(m_eta, 60)
+                    
+                    print(f"\n[INFO] Estimated JUMP Time (Pauses Only): {h_eta}h {m_eta}m {s_eta}s")
+                    # --------------------------
+
+                    lines_buffer.append(f"; === START JUMP CYCLE ({num_passes} PASSES) ===\n")
+                    for i in range(num_passes):
+                        lines_buffer.append(f"\n; --- PASS {i + 1} of {num_passes} ---\n")
+                        if i == 0:
+                            lines_buffer.extend([l + "\n" for l in lines_pass_1])
+                        else:
+                            lines_buffer.extend([l + "\n" for l in lines_pass_next])
+
+                    lines_buffer.append(f"; === END JUMP CYCLE ===\n")
+
+                    # --- RETURN TO PRE-OFFSET POSITION ---
+                    lines_buffer.append(f"; --- RETURN TO PRE-JUMP POSITION ---\n")
+                    if use_rotary:
+                        # 1. Reset physical X carriage to 0
+                        lines_buffer.append("G0 X0 ; NO_TRANSFORM\n")
+                        # 2. Move to a safe height to heat the nozzle
+                        lines_buffer.append(f"G0 Z100\n")
+                        # 3. Reset nozzle temperature
+                        lines_buffer.append(f"M109 T0 S255\n")
+                        # 4. Reset B, Y, Z axes (using original coords, transformed later)
+                        lines_buffer.append(f"G0 X{curr_x:.3f} Y{curr_y:.3f} Z{curr_z:.3f} F{curr_f:.0f}\n")
+                    else:
+                        # Flat Mode: direct return
+                        lines_buffer.append(f"G0 X{curr_x:.3f} Y{curr_y:.3f} Z{curr_z:.3f} F{curr_f:.0f}\n")
+                        # 3. Reset nozzle temperature
+                        lines_buffer.append("M109 T0 S255")
+                    # ------------------------------------------------
+
+                    jump_executed = True
+            continue
+
+        lines_buffer.append(line)
+
+    return lines_buffer, metadata
+
+
+# ==========================================
+# 4. ROTARY TRANSFORMER (Safety 38.0)
+# ==========================================
+
+def transform_buffer_v6(lines_in, metadata, original_filename):
+    min_x_val = metadata['min_x']
+    min_y_val = metadata['min_y']
+    min_z = metadata['min_z']
+    layer_height = metadata['layer_height']
+    layer_count = metadata['layer_count']
+
+    diameter_value = metadata['diameter']
+    w = metadata['w']
+    y_offset = metadata['y_offset']
+    mandrel_length = metadata['mandrel_len']
+
+    modified_lines = []
+    layer_number = -1
+    last_b_val = None
+    current_z = min_z
+
+    last_orig_e = 0.0
+    last_new_e = 0.0
+    purge_inserted = False
+
+    NOZZLE_DIA = 0.4
+    FILAMENT_DIA = 1.75
+    FILAMENT_AREA = math.pi * ((FILAMENT_DIA / 2) ** 2)
+    SAFETY_MARGIN = 38.0  # CHANGED FROM 41.0 TO 38.0
+
+    print("\n--- Running Transformation ---")
+
+    for line in lines_in:
+        line_stripped = line.strip()
+
+        if "; NO_TRANSFORM" in line:
+            modified_lines.append(line)
+            continue
+
+        if re.search(r"M140|M190|G28", line_stripped) and not line_stripped.startswith(';'):
+            continue
+
+        if ";LAYER:" in line:
+            match = re.search(r";LAYER:(\d+)", line)
+            if match: layer_number = int(match.group(1))
+
+        # Purge Line
+        if ";LAYER_COUNT:" in line.upper() and not purge_inserted and mandrel_length > 0:
+            y_limit_safe = mandrel_length - SAFETY_MARGIN
+            purge_y = y_limit_safe - 1.0
+            purge_z = (diameter_value / 2.0) + layer_height
+            circumference = math.pi * diameter_value
+            vol_needed = circumference * (layer_height * NOZZLE_DIA)
+            purge_e_amount = vol_needed / FILAMENT_AREA
+
+            purge_block = [
+                f"\n; --- PURGE LINE (Parametric) ---\n",
+                f"G0 X0 B0 Y{purge_y:.3f} Z{purge_z:.3f} F3000 ; Move to Safe Purge Start\n",
+                f"G1 B360 E{purge_e_amount:.5f} F1200 ; Extrude 360deg\n",
+                f"G92 E0 ; Reset Extruder\n",
+                f"G92 B0 ; Reset Rotation\n",
+                f"; --------------------------------\n\n"
+            ]
+            modified_lines.extend(purge_block)
+            purge_inserted = True
+
+        if "Move to corner" in line: line = ";G1 X-10 Y-10 F3000 ;Move to corner\n"
+        if ";move z" in line.lower(): line = re.sub(r'[Zz][-+]?[0-9]*\.?[0-9]+', 'Z250', line)
+
+        z_peek = re.search(r'[Zz]([-+]?[0-9]*\.?[0-9]+)', line)
+        if z_peek and 0 <= layer_number < layer_count:
+            current_z = float(z_peek.group(1))
+
+        if 0 <= layer_number < layer_count:
+            circumference = math.pi * diameter_value
+            height_from_base = max(0, current_z - min_z)
+            real_diameter = diameter_value + (2 * height_from_base)
+            flow_multiplier = real_diameter / diameter_value
+
+            x_match = re.search(r'[Xx]([-+]?[0-9]*\.?[0-9]+)', line)
+            if x_match:
+                x_val = float(x_match.group(1))
+                x_origin = x_val - min_x_val
+                adj_x = x_origin + w / 2
+                x_new = adj_x * (360 / circumference)
+                line = re.sub(r'[Xx][-+]?[0-9]*\.?[0-9]+', f'B{x_new:.3f}', line)
+
+            e_match = re.search(r'[Ee]([-+]?[0-9]*\.?[0-9]+)', line)
+            if e_match:
+                current_orig_e = float(e_match.group(1))
+                if "G92" in line:
+                    last_orig_e = current_orig_e
+                    last_new_e = current_orig_e
+                else:
+                    delta_e = current_orig_e - last_orig_e
+                    new_delta_e = delta_e * flow_multiplier
+                    new_e_val = last_new_e + new_delta_e
+                    line = re.sub(r'[Ee][-+]?[0-9]*\.?[0-9]+', f'E{new_e_val:.5f}', line)
+                    last_orig_e = current_orig_e
+                    last_new_e = new_e_val
+
+            y_match = re.search(r'[Yy]([-+]?[0-9]*\.?[0-9]+)', line)
+            if y_match:
+                y_val = float(y_match.group(1))
+                y_origin = y_val - min_y_val
+                y_new = y_origin + y_offset
+                line = re.sub(r'[Yy][-+]?[0-9]*\.?[0-9]+', f'Y{y_new:.3f}', line)
+
+            z_match = re.search(r'[Zz]([-+]?[0-9]*\.?[0-9]+)', line)
+            if z_match:
+                z_val = float(z_match.group(1))
+                z_new = z_val + diameter_value / 2
+                line = re.sub(r'[Zz][-+]?[0-9]*\.?[0-9]+', f'Z{z_new:.3f}', line)
+
+            b_match = re.search(r"[Bb]([-+]?[0-9]*\.?[0-9]+)", line)
+            has_e = "E" in line or "e" in line
+            if b_match:
+                b_val = float(b_match.group(1))
+                if not has_e and last_b_val is not None:
+                    diff = b_val - last_b_val
+                    if diff > 180:
+                        b1_new = last_b_val + 360
+                        modified_lines.append("G92 B{:.3f}\n".format(b1_new))
+                    elif diff < -180:
+                        b1_new = last_b_val - 360
+                        modified_lines.append("G92 B{:.3f}\n".format(b1_new))
+                last_b_val = b_val
+
+        modified_lines.append(line)
+
+    out_path = original_filename.replace(".gcode", "_combo_final.gcode")
+    with open(out_path, "w") as f:
+        f.writelines(modified_lines)
+
+    return out_path
+
+
+# ==========================================
+# 5. VALIDATION (Safety 38.0)
+# ==========================================
+
+def validate_transformed_gcode(filepath, mandrel_radius, mandrel_length):
+    collision_data = []
+    try:
+        with open(filepath, 'r') as f:
+            lines = f.readlines()
+    except:
+        return
+
+    Z_REGEX = r'[Zz]([-+]?[0-9]*\.?[0-9]+)'
+    Y_REGEX = r'[Yy]([-+]?[0-9]*\.?[0-9]+)'
+    B_REGEX = r'[Bb]([-+]?[0-9]*\.?[0-9]+)'
+
+    SAFETY_MARGIN = 38.0  # CHANGED FROM 41.0 TO 38.0
+    y_max_allowed = mandrel_length - SAFETY_MARGIN
+    EXCL_Y, EXCL_B, TOL = 69.800, -387.973, 0.01
+
+    for i, line in enumerate(lines):
+        line_strip = line.strip()
+        if not line_strip.startswith(';'):
+            b_m = re.search(B_REGEX, line)
+            y_m = re.search(Y_REGEX, line)
+            if b_m and y_m:
+                if abs(float(b_m.group(1)) - EXCL_B) < TOL and abs(float(y_m.group(1)) - EXCL_Y) < TOL:
+                    continue
+
+            z_m = re.search(Z_REGEX, line)
+            if z_m:
+                z_val = float(z_m.group(1))
+                if z_val < mandrel_radius:
+                    collision_data.append({'line': i + 1, 'axis': 'Z', 'val': z_val})
+
+            if y_m:
+                y_val = float(y_m.group(1))
+                if y_val > y_max_allowed:
+                    collision_data.append({'line': i + 1, 'axis': 'Y', 'val': y_val})
+
+    if collision_data:
+        print("\n🛑 COLLISIONS DETECTED!")
+        for c in collision_data:
+            print(f" -> Line {c['line']} [{c['axis']}]: Value {c['val']:.3f}")
+
+        y_err = any(c['axis'] == 'Y' for c in collision_data)
+        if y_err:
+            print("🚨 CRITICAL Y ERROR.")
+        else:
+            if input("\nDelete incorrect Z lines? (y/n): ").lower() == 'y':
+                dels = [c['line'] for c in collision_data]
+                new_l = [l if (i + 1) not in dels else f";DEL {l}" for i, l in enumerate(lines)]
+                with open(filepath, 'w') as f: f.writelines(new_l)
+                print("File corrected.")
+    else:
+        print("✅ Check OK.")
+
+
+# ==========================================
+# MAIN
+# ==========================================
+
+def main():
+    set_working_directory()
+    print("--- Combo Tool V26 (ETA Jump) ---")
+
+    main_file = select_gcode_file("Select MAIN G-Code")
+    if not main_file: return
+
+    use_rotary = input("\nROTARY Mode (X->B)? (y/n): ").lower() == 'y'
+
+    params = {}
+    if use_rotary:
+        print("\n--- V6 Configuration ---")
+        params['diameter'] = get_float_input("1. Mandrel Diameter: ")
+        params['mandrel_len'] = get_float_input("2. Mandrel Length: ", 41)
+        params['w'] = 0
+        params['y_offset'] = 0
+    else:
+        params['diameter'] = 0;
+        params['mandrel_len'] = 0
+        params['w'] = 0;
+        params['y_offset'] = 0
+
+    merged_lines, meta = read_and_merge_gcode(main_file, params, use_rotary)
+
+    if use_rotary:
+        final_path = transform_buffer_v6(merged_lines, meta, main_file)
+        validate_transformed_gcode(final_path, meta['diameter'] / 2.0, meta['mandrel_len'])
+    else:
+        clean_lines = [l.replace(" ; NO_TRANSFORM", "") for l in merged_lines]
+        final_path = main_file.replace(".gcode", "_combo_flat.gcode")
+        with open(final_path, "w") as f:
+            f.writelines(clean_lines)
+        print(f"\nFLAT Mode: Saved without rotation.")
+        print(f"JUMP Offset -> X:-90.0, Y:-26.0")
+
+    print(f"\n✅ FILE SAVED: {final_path}")
+    input("Press ENTER to exit...")
+
+
+if __name__ == "__main__":
+    main()
